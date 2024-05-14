@@ -1,0 +1,31 @@
+body {
+    background-color: #f8f9fa; /* Light gray background */
+    color: #343a40; /* Dark text color */
+}
+
+.container {
+    margin-top: 50px;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+tr.table-primary {
+    background-color: #007bff; /* Blue */
+}
+
+tr.table-secondary {
+    background-color: #6c757d; /* Gray */
+}
+
+tr.table-success {
+    background-color: #28a745; /* Green */
+}
+
+tr.table-danger {
+    background-color: #dc3545; /* Red */
+}
+
+tr.table-warning {
+    background-color: #ffc107; /* Yellow */
+}
