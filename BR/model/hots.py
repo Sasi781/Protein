@@ -1,0 +1,469 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.utils import Progbar
+from tensorflow.keras import models
+from BR.model.model import HoTSModel
+from BR.model.loss import HoTSLoss
+from BR.Feature_Extraction import *
+
+from sklearn.metrics import precision_recall_curve, auc, roc_curve, confusion_matrix
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import *
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing import sequence
+
+
+
+class HoTS(object):
+
+
+    def __init__(self):
+
+        self.protein_grid_size = None
+        self.compound_grid_size = None
+        self.anchors = None
+        self.hots_dimension = None
+        self.hots_n_heads = None
+
+        self.dropout = None
+        self.drug_layers = None
+        self.protein_strides = None
+        self.filters = None
+        self.fc_layers = None
+        self.hots_fc_layers = None
+        self.learning_rate = None
+        self.prot_vec = None
+        self.drug_vec = None
+        self.drug_len = None
+        self.activation = None
+        self.protein_layers = None
+        self.protein_encoder = None
+        self.compound_encoder = None
+        self.reg_loss_weight = None
+        self.conf_loss_weight = None
+        self.negative_loss_weight = None
+        self.retina_loss_weight = None
+        self.decay = None
+        self.model_hots = None
+        self.model_t = None
+        self.hots_file = None
+        self.dti_file = None
+        self.hots_validation_results = {}
+        self.dti_validation_results = {}
+        #self.hots_model = None
+        print("Hots model initialization done!")
+
+    def build_model(self, dropout=0.1, drug_layers=(1024,512), protein_strides = (10,15,20,25), filters=64,
+                 hots_dimension=64, n_stack_hots_prediction=0,
+                 fc_layers=None, hots_fc_layers=None, activation="relu",
+                 protein_layers=None, protein_encoder_config={}, compound_encoder_config={},
+                 protein_grid_size=10, anchors=[10, 15, 20], hots_n_heads=4, **kwargs):
+        self.protein_grid_size = protein_grid_size
+        self.n_stack_hots_prediction = n_stack_hots_prediction
+        self.anchors = anchors
+        self.hots_dimension = hots_dimension
+        self.hots_n_heads = hots_n_heads
+
+        self.dropout = dropout
+        self.drug_layers = drug_layers
+        self.protein_strides = protein_strides
+        self.filters = filters
+        self.fc_layers = fc_layers
+        self.hots_fc_layers = hots_fc_layers
+        self.prot_vec = protein_encoder_config["feature"]
+        self.drug_vec = compound_encoder_config["feature"]
+        self.drug_len = compound_encoder_config["n_bits"]
+        self.activation = activation
+        self.protein_layers = protein_layers
+        self.protein_encoder_config = protein_encoder_config
+        self.protein_encoder = ProteinEncoder(**protein_encoder_config)
+        self.compound_encoder_config = compound_encoder_config
+        self.compound_encoder = CompoundEncoder(**compound_encoder_config)
+        hots_model = HoTSModel(self.drug_layers, self.protein_strides, self.filters, self.fc_layers, self.hots_fc_layers,
+                               dropout=self.dropout, hots_dimension=self.hots_dimension,
+                               activation=self.activation, protein_grid_size=self.protein_grid_size,
+                                protein_layers=self.protein_layers,drug_vec=self.drug_vec, drug_len=self.drug_len, anchors=self.anchors,
+                               hots_n_heads=self.hots_n_heads, n_stack_hots_prediction=self.n_stack_hots_prediction)
+        self.model_hots, self.model_t = hots_model.get_model_hots(), hots_model.get_model_t()
+        #K.get_session().run(tf.global_variables_initializer())
+
+    def get_model(self):
+        return self.model_hots, self.model_t
+
+    def save_model(self, model_config=None, hots_file=None, dti_file=None):
+        self.hots_file = hots_file
+        self.dti_file = dti_file
+        class_dict = self.__dict__
+        model_t = class_dict.pop("model_t")
+        model_hots = class_dict.pop("model_hots")
+        print("Saving model to... %s"%model_config)
+        if model_config is not None:
+            import json
+            protein_encoder = class_dict.pop("protein_encoder")
+            compound_encoder = class_dict.pop("compound_encoder")
+            hots_loss = class_dict.pop("hots_loss")
+            opt_dti = class_dict.pop('opt_dti')
+            opt_hots = class_dict.pop('opt_hots')
+            f = open(model_config, 'w')
+            json.dump(class_dict, f)
+            f.close()
+            self.protein_encoder = protein_encoder
+            self.compound_encoder = compound_encoder
+            self.hots_loss = hots_loss
+            self.opt_dti = opt_dti
+            self.opt_hots = opt_hots
+        if hots_file is not None:
+            model_hots.save(hots_file, overwrite=True)
+            print("\tHoTS Model saved at %s"%hots_file)
+            self.model_hots = model_hots
+        if dti_file is not None:
+            model_t.save(dti_file, overwrite=True)
+            print("\tDTI Model saved at %s"%dti_file)
+            self.model_t = model_t
+
+    def load_model(self, model_config=None, hots_file=None, dti_file=None):
+        if model_config is not None:
+            import json
+            f = open(model_config, encoding="UTF-8")
+            class_dict = json.loads(f.read())
+            f.close()
+            print("Given hyperparamters in %s are loaded"%model_config)
+            print("")
+            for key, value in class_dict.items():
+                print("{0:20}: ".format(key), value)
+            print(" ")
+            self.build_model(**class_dict)
+            #self.summary()
+            hots_file = class_dict["hots_file"]
+            self.model_hots.load_weights(hots_file, by_name=True)
+	    
+            #custom_objects = {"PLayer":self.hots_model.PLayer,
+            #                  "repeat_vector":self.hots_model.repeat_vector,
+            #                  "dense_norm":self.hots_model.dense_norm,
+            #                  "time_distributed_dense_norm": self.hots_model.time_distributed_dense_norm,
+            #                  "attention":self.hots_model.attention,
+            #                  "self_attention":self.hots_model.self_attention,
+            #                  "crop":self.hots_model.crop,
+            #                  "position_embedding":self.hots_model.position_embedding}
+
+            #self.model_hots = models.load_model(hots_file, custom_objects=custom_objects)
+            print("\tHoTS Model is loaded from %s"%hots_file)
+            dti_file = class_dict["dti_file"]
+            self.model_t.load_weights(dti_file, by_name=True)
+            #self.model_t = models.load_model(dti_file, custom_objects=custom_objects)
+            print("\tDTI Model is loaded from %s"%dti_file)
+        else:
+            if hots_file is not None:
+                self.model_hots.load_weights(hots_file)
+                print("\tHoTS Model loaded at %s"%hots_file)
+            if dti_file is not None:
+                self.model_t.load_weights(dti_file)
+                print("\tDTI Model loaded at %s"%dti_file)
+
+    def summary(self, hots_plot=None, dti_plot=None):
+        print("DTI summary")
+        self.model_t.summary()
+        print("HoTS summary")
+        self.model_hots.summary()
+
+    def HoTS_train(self, protein_feature, index_feature, drug_feature, batch_size=32, **kwargs):
+        train_n_steps = int((np.ceil(len(protein_feature))/batch_size))
+        train_gen = DataGeneratorHoTS(protein_feature, ind_label=index_feature, ligand=drug_feature,
+                              anchors=self.anchors, batch_size=batch_size,
+                              train=True, shuffle=True, protein_encoder=self.protein_encoder,
+                              compound_encoder=self.compound_encoder, grid_size=self.protein_grid_size)
+
+        prog_bar = Progbar(train_n_steps)
+        total_reg_loss = 0
+        for i in range(train_n_steps):
+            train_seq_batch, train_HoTs, train_mask, train_indice, train_ligand_batch, train_dtis, train_names = train_gen.next()
+            loss = self.model_hots.train_on_batch([train_ligand_batch, train_seq_batch, train_mask], train_HoTs)
+            #loss_sum, reg_loss, dti_loss = loss
+            reg_loss = loss
+            total_reg_loss += reg_loss
+            prog_bar.update(i+1, values=[("train_reg_loss", total_reg_loss/(i+1))])
+
+    def DTI_train(self, drug_feature, protein_feature, label, batch_size=32, start_epoch=0):
+        train_n_steps = int(np.ceil(len(label) / batch_size))
+        train_gen = DataGeneratorDTI(drug_feature, protein_feature, train_label=label, batch_size=batch_size,
+                                     protein_encoder=self.protein_encoder, compound_encoder=self.compound_encoder,
+                                     grid_size=self.protein_grid_size)
+        total_bce_loss = 0
+        total_accuracy = 0
+        prog_bar = Progbar(train_n_steps)
+        for i in range(train_n_steps):
+            train_input, train_target = train_gen.next()
+            loss = self.model_t.train_on_batch(train_input, train_target)
+            #loss_sum, reg_loss, dti_loss = loss
+            bce_loss, accuracy = loss
+            total_bce_loss += bce_loss
+            total_accuracy += accuracy
+            prog_bar.update(i+1, values=[("BCE_loss: ", total_bce_loss/(i+1)), ("accuracy: ", total_accuracy/(i+1))])
+
+
+    def DTI_prediction(self, drug_feature, protein_feature, label=None, output_file=None, batch_size=32, **kwargs):
+        test_n_steps = int(np.ceil(len(protein_feature)/batch_size))
+        test_gen = DataGeneratorDTI(drug_feature, protein_feature, protein_encoder=self.protein_encoder,
+                                 compound_encoder=self.compound_encoder, batch_size=batch_size,
+                                 grid_size=self.protein_grid_size, train=False)
+        predicted_dtis = []
+        for j in range(test_n_steps):
+            test_drug, test_seq, test_mask  = test_gen.next()
+            prediction_dti = self.model_t.predict_on_batch([test_drug, test_seq, test_mask])
+            predicted_dtis.append(prediction_dti)
+        predicted_dtis = np.concatenate(predicted_dtis)
+        if output_file:
+            import pandas as pd
+            result_df = pd.DataFrame()
+            if label:
+                result_df["label"] = label
+            result_df["predicted"] = predicted_dtis
+            result_df.save(output_file, index=False)
+        else:
+            return predicted_dtis
+
+    def DTI_chemical_library_prediction(self, chemical_library, protein_id, output_file, batch_size=32, **kwargs):
+        from urllib.request import urlopen
+        uniprot_url = "https://www.uniprot.org/uniprot/{0}.fasta"
+        opened = urlopen(uniprot_url.format(protein_id))
+        lines = opened.readlines()
+        target_protein = "".join([line.rstrip() for line in lines[1:] ])
+        chemical_library_gen = DataGeneratorChemicalLibrary(chemical_library, target_protein,
+                                                            batch_size=batch_size, protein_encoder=self.protein_encoder,
+                                                            compound_encoder=self.protein_grid_size,
+                                                            grid_size=self.protein_grid_size)
+        output_file_opened = open(output_file, 'w')
+        try:
+            while True:
+                drug_feature, seq_feature, masks, drugs   = chemical_library_gen.next()
+                prediction_dti = self.model_t.predict_on_batch([drug_feature, seq_feature, masks])
+                for score, drug in zip(prediction_dti[:, 0], drugs):
+                    scores_out = ",".join([drug, str(score)])
+                    output_file_opened.write(scores_out)
+                    output_file_opened.flush()
+        except StopIteration as e:
+            output_file_opened.close()
+
+
+
+    def HoTS_prediction(self, drug_feature, protein_feature, th=0., batch_size=32, **kwargs):
+        test_n_steps = int(np.ceil(len(protein_feature)/batch_size))
+        test_gen = DataGeneratorHoTS(protein_feature, ind_label=None, ligand=drug_feature, name=None, anchors=self.anchors,
+                                     batch_size=batch_size, train=False, shuffle=False, compound_encoder=self.compound_encoder,
+                                     protein_encoder=self.protein_encoder, grid_size=self.protein_grid_size)
+        predicted_dtis = []
+        predicted_indice = []
+        for j in range(test_n_steps):
+            test_seq, test_mask, test_ligand = test_gen.next()
+            test_max_len = test_seq.shape[1]
+            prediction_dti = self.model_t.predict_on_batch([test_ligand, test_seq, test_mask])
+            prediction_hots = self.model_hots.predict_on_batch([test_ligand, test_seq, test_mask])
+            hots_pooling = HoTSPooling(self.protein_grid_size, max_len=test_max_len, anchors=self.anchors,
+                                        protein_encoder=self.protein_encoder)
+            predicted_pooling_index = hots_pooling.hots_grid_to_subsequence(test_seq, prediction_hots, th=th)
+            predicted_dtis.append(prediction_dti)
+            predicted_indice += predicted_pooling_index
+        predicted_dtis = np.concatenate(predicted_dtis)
+        return predicted_dtis, predicted_indice
+
+    def DTI_validation(self, drug_feature, protein_feature, label, gamma=2, batch_size=32, threshold=None, **kwargs):
+        result_dic = {}
+        n_steps = int(np.ceil(len(label)/batch_size))
+        prediction = self.DTI_prediction(drug_feature, protein_feature, label=None, batch_size=batch_size)
+
+        if threshold:
+            prediction_copied = prediction.copy()
+            prediction_copied[prediction_copied>=threshold] = 1
+            prediction_copied[prediction_copied<threshold] = 0
+            tn, fp, fn, tp = confusion_matrix(label, prediction_copied).ravel()
+            sen = float(tp)/(fn+tp)
+            pre = float(tp)/(tp+fp)
+            spe = float(tn)/(tn+fp)
+            acc = float(tn+tp)/(tn+fp+fn+tp)
+            f1 = (2*sen*pre)/(sen+pre)
+            print("\tSen : ", sen )
+            print("\tSpe : ", spe )
+            print("\tPrecision : ", pre)
+            print("\tAcc : ", acc )
+            print("\tF1 : ", f1)
+            result_dic.update({"Sen": sen, "Spe": spe, "Acc":acc, "Pre": pre, "F1": f1})
+        fpr, tpr, thresholds_AUC = roc_curve(label, prediction)
+        AUC = auc(fpr, tpr)
+        precision, recall, thresholds = precision_recall_curve(label,prediction)
+        distance = (1-fpr)**2+(1-tpr)**2
+        EERs = (1-recall)/(1-precision)
+        positive = sum(label)
+        negative = label.shape[0]-positive
+        opt_t_AUC = thresholds_AUC[np.argmin(distance)]
+        opt_t_AUPR = thresholds[np.argmin(np.abs(EERs-(negative/positive)))]
+        AUPR = auc(recall,precision)
+        print("\tArea Under ROC Curve(AUC): %0.3f" % AUC)
+        print("\tArea Under PR Curve(AUPR): %0.3f" % AUPR)
+        print("\tOptimal threshold(AUC)   : %0.3f " % opt_t_AUC)
+        print("\tOptimal threshold(AUPR)  : %0.3f" % opt_t_AUPR)
+        result_dic.update({"AUC": AUC, "AUPR":AUPR})
+        print("=================================================")
+        return result_dic
+
+    def HoTS_validation(self, drug_feature, protein_feature, index_feature, protein_names,
+                        pdb_starts=None, pdb_ends=None,
+                        batch_size=32, **kwargs):
+
+        n_steps = int(np.ceil(len(protein_feature)/batch_size))
+        if not pdb_starts:
+            pdb_starts = [0]*len(drug_feature)
+        if not pdb_ends:
+            pdb_ends = [10000]*len(drug_feature)
+        predicted_score, predicted_index = self.HoTS_prediction(drug_feature, protein_feature,
+                                                                batch_size=batch_size)
+        mean_ap = AP_calculator(index_feature, predicted_index, pdb_starts, pdb_ends,
+                      min_value=self.anchors[0], max_value=int(self.anchors[-1]*np.e)).get_AP()
+        print("\tAP : ", mean_ap)
+        print("=================================================")
+
+        return {"AP":mean_ap}
+
+    def get_HoTS_validation(self):
+        return self.hots_validation_results
+
+    def get_DTI_validation(self):
+        return self.dti_validation_results
+
+    def HoTS_visualization(self, drug_feature, protein_feature, sequence, pdb_starts=None, pdb_ends=None, print_score=True,
+                           index_feature=None, protein_names=None, line_length=100, th=0.75, batch_size=32, output_file=None,
+                           top_n=None, **kwargs):
+        predicted_score, predicted_index = self.HoTS_prediction(drug_feature, protein_feature, th=th,
+                                                                batch_size=batch_size)
+        if top_n:
+            predicted_index = predicted_index[:,:top_n]
+        print("Prediction with %f"%th)
+        if not pdb_starts:
+            pdb_starts = [0]*len(drug_feature)
+        if not pdb_ends:
+            pdb_ends = [10000]*len(drug_feature)
+        if output_file:
+            output_file = open(output_file, 'w')
+        if index_feature:
+            for protein_name, s, i, p, pdbs, pdbe, score in zip(protein_names, sequence,
+                                                                index_feature, predicted_index,
+                                                                pdb_starts, pdb_ends, predicted_score):
+                print(protein_name)
+                p = [(pred_start, pred_end, pred_score) for pred_start, pred_end, pred_score in p
+                               if ((pred_end >= pdbs) & (pred_start <= pdbe))]
+                print("DTI score : ", score[0])
+                print_binding(s, p, line_length, i, output_file, print_score=print_score)
+        else:
+            for protein_name, s, p, score in zip(protein_names, sequence, predicted_index, predicted_score):
+                print(protein_name)
+                print("DTI score : ", score)
+                #print("HoTS Precision : ",precision, " HoTS Recall : ", recall)
+                if output_file:
+                    output_file.write(protein_name+'\n')
+                print_binding(s, p, line_length, None, output_file, print_score=print_score)
+        if output_file:
+            output_file.close()
+
+    def validate_datasets(self, datasets, dataset_types=("HoTS", "DTI", "VIS"), batch_size=16):
+        for dataset in datasets:
+            dataset_type = dataset.split("_")[-1]
+            dataset_dic = datasets[dataset]
+            dataset_dic.update({"batch_size": batch_size})
+            if (dataset_type=="HoTS") & (dataset_type in dataset_types):
+                print("\tPrediction of " + dataset)
+                self.hots_validation_results[dataset].append(self.HoTS_validation(**dataset_dic))
+            elif (dataset_type=="DTI") & (dataset_type in dataset_types):
+                print("\tPrediction of " + dataset)
+                self.dti_validation_results[dataset].append(self.DTI_validation(**dataset_dic))
+            elif (dataset_type=="VIS") & (dataset_type in dataset_types):
+                self.HoTS_visualization(**dataset_dic)
+
+    def training(self, dti_dataset, hots_dataset,n_epoch=10, batch_size=32, learning_rate=1e-3, decay=1e-3,
+                 retina_loss_weight=2, reg_loss_weight=1., conf_loss_weight=10, negative_loss_weight=0.1,
+                   hots_training_ratio=1, hots_warm_up_epoch=20, **kwargs):
+        self.learning_rate = learning_rate
+        self.decay = decay
+
+        self.reg_loss_weight = reg_loss_weight
+        self.conf_loss_weight = conf_loss_weight
+        self.negative_loss_weight = negative_loss_weight
+        self.retina_loss_weight = retina_loss_weight
+
+        self.hots_loss = HoTSLoss(grid_size=self.protein_grid_size, anchors=self.anchors,
+                                    reg_loss_weight=self.reg_loss_weight, conf_loss_weight=self.conf_loss_weight,
+                                    negative_loss_weight=self.negative_loss_weight, retina_loss_weight=self.retina_loss_weight)
+
+        self.opt_hots =  tf.keras.optimizers.legacy.Adam(lr=learning_rate, decay=self.decay)
+        self.opt_dti =  tf.keras.optimizers.legacy.Adam(lr=learning_rate, decay=self.decay)
+
+        self.model_t.compile(optimizer=self.opt_dti, loss='binary_crossentropy', metrics=['accuracy'])
+        self.model_hots.compile(optimizer=self.opt_hots, loss=self.hots_loss.compute_hots_loss)
+
+        n_hots_trains = 0
+        for dataset in kwargs:
+            is_hots = dataset.split("_")[-1] == "HoTS"
+            if is_hots:
+                self.hots_validation_results[dataset] = []
+            is_dti = dataset.split("_")[-1]=="DTI"
+            if is_dti:
+                self.dti_validation_results[dataset] = []
+
+        # HoTS_data
+        hots_protein_feature = hots_dataset["protein_feature"]
+        index_feature =  hots_dataset["index_feature"]
+        hots_drug_feature = hots_dataset["drug_feature"]
+
+        # DTI_data
+        protein_feature = dti_dataset["protein_feature"]
+        drug_feature = dti_dataset["drug_feature"]
+        label = dti_dataset["label"]
+
+        # Warming-up
+        for j in range(hots_warm_up_epoch):
+            # Train Hots
+            print("HoTS training epoch %d"%(n_hots_trains+1))
+            self.HoTS_train(hots_protein_feature, index_feature, hots_drug_feature, batch_size=batch_size)
+            n_hots_trains += 1
+            self.validate_datasets(kwargs, dataset_types=("HoTS"), batch_size=batch_size)
+        # Validate DTI
+        for z in range(n_epoch):
+            # Train DTI
+            train_n_steps = int(np.ceil(len(label)/batch_size))
+
+            for dti_layer in self.model_t.layers:
+                if dti_layer.name.split("_")[0]=="HoTS":
+                    dti_layer.trainable = False
+                if dti_layer.name.split("_")[0]=="DTI":
+                    dti_layer.trainable = True
+                    #print("%s layer is set to non-trainable"%hots_layer.name)
+            self.model_t.compile(optimizer=self.opt_dti, loss='binary_crossentropy', metrics=['accuracy'])
+
+            self.DTI_train(drug_feature, protein_feature, label, batch_size, z)
+            # Validate DTI
+            self.validate_datasets(kwargs, batch_size=batch_size)
+            # Train HoTS with DTI for N times
+            for dti_layer in self.model_hots.layers:
+                if dti_layer.name.split("_")[0]=="HoTS":
+                    dti_layer.trainable = True
+                if dti_layer.name.split("_")[0]=="DTI":
+                    dti_layer.trainable = False
+                    #print("%s layer is set to non-trainable"%hots_layer.name)
+            self.model_hots.compile(optimizer=self.opt_hots, loss=self.hots_loss.compute_hots_loss,)
+            for j in range(hots_training_ratio):
+                # Train Hots
+                print("HoTS training epoch %d"%(n_hots_trains+1))
+                self.HoTS_train(hots_protein_feature, index_feature, hots_drug_feature, batch_size=batch_size, epoch=z)
+                n_hots_trains += 1
+                self.validate_datasets(kwargs, batch_size=batch_size)
+            for dti_layer in self.model_t.layers:
+                dti_layer.trainable = True
+            self.model_t.compile(optimizer=self.opt_dti, loss='binary_crossentropy', metrics=['accuracy'])
+            for dti_layer in self.model_hots.layers:
+                dti_layer.trainable = True
+                    #print("%s layer is set to non-trainable"%hots_layer.name)
+            self.model_hots.compile(optimizer=self.opt_hots, loss=self.hots_loss.compute_hots_loss)
+
+
+
+
+
